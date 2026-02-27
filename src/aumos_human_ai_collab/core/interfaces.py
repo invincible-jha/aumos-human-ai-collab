@@ -16,6 +16,39 @@ from aumos_human_ai_collab.core.models import (
     RoutingDecision,
 )
 
+# ---------------------------------------------------------------------------
+# Re-export adapter types so services can type-hint against them
+# ---------------------------------------------------------------------------
+from aumos_human_ai_collab.adapters.feedback_aggregator import (  # noqa: F401
+    FeedbackAggregator,
+    FeedbackRecord,
+)
+from aumos_human_ai_collab.adapters.annotation_engine import (  # noqa: F401
+    AnnotationEngine,
+    AnnotationTask,
+    Annotation,
+)
+from aumos_human_ai_collab.adapters.consensus_scorer import ConsensusScorer  # noqa: F401
+from aumos_human_ai_collab.adapters.active_learner import (  # noqa: F401
+    ActiveLearner,
+    LearningCurvePoint,
+)
+from aumos_human_ai_collab.adapters.explainability_bridge import (  # noqa: F401
+    ExplainabilityBridge,
+)
+from aumos_human_ai_collab.adapters.performance_tracker import (  # noqa: F401
+    PerformanceTracker,
+    MetricSnapshot,
+)
+from aumos_human_ai_collab.adapters.calibration_engine import (  # noqa: F401
+    CalibrationEngine,
+    CalibrationRecord,
+)
+from aumos_human_ai_collab.adapters.review_queue_manager import (  # noqa: F401
+    ReviewQueueManager,
+    QueueItem,
+)
+
 
 @runtime_checkable
 class IRoutingDecisionRepository(Protocol):
@@ -489,5 +522,675 @@ class IConfidenceEngineAdapter(Protocol):
 
         Returns:
             Recalibration result dict with new threshold recommendations.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# New domain-specific adapter protocols
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IFeedbackAggregator(Protocol):
+    """Interface for user feedback collection and trend analysis."""
+
+    async def store_feedback(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        feature: str,
+        rating: int,
+        category: str,
+        text: str | None,
+        submitted_by: uuid.UUID | None,
+    ) -> Any:
+        """Store a single feedback record.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            model_id: Model being rated.
+            feature: Feature being rated.
+            rating: Integer rating 1–5.
+            category: Feedback category.
+            text: Optional free-text comment.
+            submitted_by: Optional submitter UUID.
+
+        Returns:
+            Stored FeedbackRecord.
+        """
+        ...
+
+    async def aggregate_by_model(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        window_days: int,
+    ) -> dict[str, Any]:
+        """Aggregate feedback metrics for a model over a time window.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            window_days: Lookback window in days.
+
+        Returns:
+            Aggregate statistics dict.
+        """
+        ...
+
+    async def get_top_issues(
+        self,
+        tenant_id: uuid.UUID,
+        window_days: int,
+        top_n: int,
+    ) -> list[dict[str, Any]]:
+        """Identify top issues by rating and volume.
+
+        Args:
+            tenant_id: Requesting tenant.
+            window_days: Lookback window.
+            top_n: Number of issues to return.
+
+        Returns:
+            List of issue dicts sorted by severity.
+        """
+        ...
+
+    async def export_records(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str | None,
+        feature: str | None,
+        category: str | None,
+        window_days: int | None,
+    ) -> list[dict[str, Any]]:
+        """Export feedback records as a list of dicts.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Optional model filter.
+            feature: Optional feature filter.
+            category: Optional category filter.
+            window_days: Optional lookback window.
+
+        Returns:
+            List of serialised feedback record dicts.
+        """
+        ...
+
+
+@runtime_checkable
+class IAnnotationEngine(Protocol):
+    """Interface for crowdsourced annotation task management."""
+
+    async def create_task(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str,
+        name: str,
+        items: list[dict[str, Any]],
+        labels: list[str],
+        gold_items: list[dict[str, Any]] | None,
+        annotations_per_item: int | None,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Create a new annotation task.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            task_type: Type of labeling task.
+            name: Human-readable task name.
+            items: Items to annotate.
+            labels: Valid label strings.
+            gold_items: Optional gold standard items.
+            annotations_per_item: Override default.
+            metadata: Additional configuration.
+
+        Returns:
+            Task summary dict.
+        """
+        ...
+
+    async def assign_annotators(
+        self,
+        task_id: uuid.UUID,
+        annotator_ids: list[uuid.UUID],
+    ) -> dict[str, Any]:
+        """Assign annotators to a task.
+
+        Args:
+            task_id: Task UUID.
+            annotator_ids: Annotator UUIDs.
+
+        Returns:
+            Assignment summary dict.
+        """
+        ...
+
+    async def store_annotation(
+        self,
+        task_id: uuid.UUID,
+        item_id: str,
+        annotator_id: uuid.UUID,
+        label: str,
+        confidence: float | None,
+        notes: str | None,
+    ) -> dict[str, Any]:
+        """Store an annotation from an annotator.
+
+        Args:
+            task_id: Task UUID.
+            item_id: Item being annotated.
+            annotator_id: Annotator UUID.
+            label: Chosen label.
+            confidence: Optional annotator confidence.
+            notes: Optional notes.
+
+        Returns:
+            Annotation result dict.
+        """
+        ...
+
+    async def get_task_progress(self, task_id: uuid.UUID) -> dict[str, Any]:
+        """Return progress statistics for a task.
+
+        Args:
+            task_id: Task UUID.
+
+        Returns:
+            Progress dict.
+        """
+        ...
+
+    async def export_annotations(
+        self,
+        task_id: uuid.UUID,
+        format: str,
+        exclude_gold: bool,
+    ) -> str:
+        """Export annotations in JSONL or CSV format.
+
+        Args:
+            task_id: Task UUID.
+            format: "jsonl" or "csv".
+            exclude_gold: Exclude gold items if True.
+
+        Returns:
+            Exported content string.
+        """
+        ...
+
+
+@runtime_checkable
+class IConsensusScorer(Protocol):
+    """Interface for multi-annotator agreement computation."""
+
+    def compute_fleiss_kappa(
+        self,
+        annotations: list[dict[str, str]],
+        labels: list[str],
+    ) -> dict[str, Any]:
+        """Compute Fleiss' kappa.
+
+        Args:
+            annotations: Annotation dicts with item_id, annotator_id, label.
+            labels: All possible labels.
+
+        Returns:
+            Kappa result dict.
+        """
+        ...
+
+    def compute_cohen_kappa(
+        self,
+        annotator_a_labels: list[str],
+        annotator_b_labels: list[str],
+        labels: list[str],
+    ) -> dict[str, Any]:
+        """Compute Cohen's kappa for two annotators.
+
+        Args:
+            annotator_a_labels: Labels from annotator A.
+            annotator_b_labels: Labels from annotator B.
+            labels: All possible labels.
+
+        Returns:
+            Kappa result dict.
+        """
+        ...
+
+    def majority_vote(
+        self,
+        item_id: str,
+        annotations: list[dict[str, str]],
+        min_agreement_pct: float,
+    ) -> dict[str, Any]:
+        """Resolve label via majority voting.
+
+        Args:
+            item_id: Item being resolved.
+            annotations: Annotation dicts.
+            min_agreement_pct: Minimum agreement fraction.
+
+        Returns:
+            Resolution dict.
+        """
+        ...
+
+    def generate_consensus_report(
+        self,
+        task_id: str,
+        annotations: list[dict[str, str]],
+        labels: list[str],
+        annotator_ids: list[uuid.UUID],
+    ) -> dict[str, Any]:
+        """Generate a consensus report for a task.
+
+        Args:
+            task_id: Task identifier.
+            annotations: All task annotations.
+            labels: All possible labels.
+            annotator_ids: All annotators.
+
+        Returns:
+            Consensus report dict.
+        """
+        ...
+
+
+@runtime_checkable
+class IActiveLearner(Protocol):
+    """Interface for uncertainty-based sample selection."""
+
+    def add_to_pool(
+        self,
+        session_id: uuid.UUID,
+        samples: list[dict[str, Any]],
+    ) -> int:
+        """Add unlabelled samples to the pool.
+
+        Args:
+            session_id: Session UUID.
+            samples: Sample dicts.
+
+        Returns:
+            Total pool size.
+        """
+        ...
+
+    async def select_samples(
+        self,
+        session_id: uuid.UUID,
+        batch_size: int | None,
+    ) -> dict[str, Any]:
+        """Select informative samples for labelling.
+
+        Args:
+            session_id: Session UUID.
+            batch_size: Override batch size.
+
+        Returns:
+            Selection result dict.
+        """
+        ...
+
+    async def record_round_result(
+        self,
+        session_id: uuid.UUID,
+        labels_used: int,
+        estimated_accuracy: float,
+    ) -> Any:
+        """Record a round outcome for learning curve tracking.
+
+        Args:
+            session_id: Session UUID.
+            labels_used: Labels used this round.
+            estimated_accuracy: Model accuracy after this round.
+
+        Returns:
+            LearningCurvePoint.
+        """
+        ...
+
+    def get_budget_status(self) -> dict[str, Any]:
+        """Return current budget usage.
+
+        Returns:
+            Budget status dict.
+        """
+        ...
+
+
+@runtime_checkable
+class IExplainabilityBridge(Protocol):
+    """Interface for SHAP/LIME explanation retrieval for human reviewers."""
+
+    async def get_shap_explanation(
+        self,
+        model_id: str,
+        input_data: dict[str, Any],
+        prediction: dict[str, Any],
+        tenant_id: uuid.UUID,
+        top_features: int,
+    ) -> dict[str, Any]:
+        """Retrieve SHAP feature importance for a prediction.
+
+        Args:
+            model_id: Model identifier.
+            input_data: Prediction input.
+            prediction: Model output.
+            tenant_id: Requesting tenant.
+            top_features: Number of top features.
+
+        Returns:
+            SHAP explanation dict.
+        """
+        ...
+
+    async def get_lime_explanation(
+        self,
+        model_id: str,
+        input_data: dict[str, Any],
+        prediction: dict[str, Any],
+        tenant_id: uuid.UUID,
+        num_samples: int,
+        top_features: int,
+    ) -> dict[str, Any]:
+        """Retrieve a LIME explanation for a prediction.
+
+        Args:
+            model_id: Model identifier.
+            input_data: Prediction input.
+            prediction: Model output.
+            tenant_id: Requesting tenant.
+            num_samples: LIME perturbation count.
+            top_features: Number of top features.
+
+        Returns:
+            LIME explanation dict.
+        """
+        ...
+
+    async def get_explanation_for_review(
+        self,
+        model_id: str,
+        input_data: dict[str, Any],
+        prediction: dict[str, Any],
+        tenant_id: uuid.UUID,
+        method: str,
+    ) -> dict[str, Any]:
+        """Get a complete explanation package for a reviewer.
+
+        Args:
+            model_id: Model identifier.
+            input_data: Prediction input.
+            prediction: Model output.
+            tenant_id: Requesting tenant.
+            method: "shap" or "lime".
+
+        Returns:
+            Reviewer explanation package dict.
+        """
+        ...
+
+
+@runtime_checkable
+class IPerformanceTracker(Protocol):
+    """Interface for continuous model performance tracking."""
+
+    async def record_metric(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        model_version: str,
+        metric_name: str,
+        metric_value: float,
+        segment: str | None,
+        data_type: str | None,
+        feedback_round_id: str | None,
+    ) -> Any:
+        """Record a model metric snapshot.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            model_id: Model identifier.
+            model_version: Model version string.
+            metric_name: Metric name.
+            metric_value: Measured value.
+            segment: Optional user segment.
+            data_type: Optional data type label.
+            feedback_round_id: Optional feedback round link.
+
+        Returns:
+            MetricSnapshot.
+        """
+        ...
+
+    async def get_accuracy_trend(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        metric_name: str,
+        window_days: int,
+        segment: str | None,
+    ) -> dict[str, Any]:
+        """Return metric trend over a time window.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            metric_name: Metric to trend.
+            window_days: Lookback window.
+            segment: Optional segment filter.
+
+        Returns:
+            Trend dict with data_points, direction, and delta.
+        """
+        ...
+
+    async def compare_versions(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        version_a: str,
+        version_b: str,
+        metric_name: str,
+        window_days: int,
+    ) -> dict[str, Any]:
+        """Compare performance between two model versions.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            version_a: First version.
+            version_b: Second version.
+            metric_name: Metric to compare.
+            window_days: Lookback window.
+
+        Returns:
+            A/B comparison dict.
+        """
+        ...
+
+    async def generate_performance_report(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        window_days: int,
+        include_versions: list[str] | None,
+    ) -> dict[str, Any]:
+        """Generate a comprehensive performance report.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            window_days: Lookback window.
+            include_versions: Optional specific versions.
+
+        Returns:
+            Performance report dict.
+        """
+        ...
+
+
+@runtime_checkable
+class ICalibrationEngine(Protocol):
+    """Interface for confidence score recalibration."""
+
+    def compute_ece(
+        self,
+        confidences: list[float],
+        labels: list[int],
+        n_bins: int,
+    ) -> dict[str, Any]:
+        """Compute Expected Calibration Error.
+
+        Args:
+            confidences: Predicted confidence scores.
+            labels: Binary ground-truth labels.
+            n_bins: Number of histogram bins.
+
+        Returns:
+            ECE result dict with bin_data.
+        """
+        ...
+
+    def apply_calibration(
+        self,
+        raw_confidence: float,
+        params: dict[str, Any],
+    ) -> float:
+        """Apply calibration parameters to a raw confidence score.
+
+        Args:
+            raw_confidence: Raw model confidence.
+            params: Calibration params dict.
+
+        Returns:
+            Calibrated confidence score.
+        """
+        ...
+
+    async def recalibrate_from_feedback(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str,
+        confidences: list[float],
+        labels: list[int],
+        method: str,
+    ) -> Any:
+        """Recalibrate from feedback-derived ground truth.
+
+        Args:
+            tenant_id: Requesting tenant.
+            task_type: Task type being calibrated.
+            confidences: Historical confidence scores.
+            labels: Ground truth labels.
+            method: Calibration method.
+
+        Returns:
+            CalibrationRecord.
+        """
+        ...
+
+    def get_calibration_history(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return calibration history.
+
+        Args:
+            tenant_id: Requesting tenant.
+            task_type: Optional task type filter.
+            limit: Maximum records.
+
+        Returns:
+            List of CalibrationRecord dicts.
+        """
+        ...
+
+
+@runtime_checkable
+class IReviewQueueManager(Protocol):
+    """Interface for the Redis-backed HITL review priority queue."""
+
+    async def enqueue(
+        self,
+        tenant_id: uuid.UUID,
+        review_id: uuid.UUID,
+        task_type: str,
+        confidence: float,
+        urgency: int,
+        metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Enqueue a review item.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            review_id: HITLReview UUID.
+            task_type: Task category.
+            confidence: Model confidence score.
+            urgency: Review urgency 1–4.
+            metadata: Optional context.
+
+        Returns:
+            QueueItem.
+        """
+        ...
+
+    async def assign_to_reviewer(
+        self,
+        tenant_id: uuid.UUID,
+        reviewer_id: uuid.UUID,
+    ) -> Any | None:
+        """Dequeue highest-priority item and assign to reviewer.
+
+        Args:
+            tenant_id: Requesting tenant.
+            reviewer_id: Reviewer UUID.
+
+        Returns:
+            Assigned QueueItem or None if queue is empty.
+        """
+        ...
+
+    async def mark_completed(
+        self,
+        tenant_id: uuid.UUID,
+        item_id: uuid.UUID,
+    ) -> Any:
+        """Mark a queue item as completed.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            item_id: Queue item UUID.
+
+        Returns:
+            Updated QueueItem.
+        """
+        ...
+
+    async def get_queue_depth(self, tenant_id: uuid.UUID) -> int:
+        """Return number of pending items.
+
+        Args:
+            tenant_id: Requesting tenant.
+
+        Returns:
+            Pending item count.
+        """
+        ...
+
+    async def get_queue_analytics(self, tenant_id: uuid.UUID) -> dict[str, Any]:
+        """Return queue analytics.
+
+        Args:
+            tenant_id: Requesting tenant.
+
+        Returns:
+            Analytics dict.
         """
         ...

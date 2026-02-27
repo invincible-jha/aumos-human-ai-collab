@@ -20,11 +20,19 @@ from aumos_common.events import EventPublisher, Topics
 from aumos_common.observability import get_logger
 
 from aumos_human_ai_collab.core.interfaces import (
+    IActiveLearner,
+    IAnnotationEngine,
     IAttributionRepository,
+    ICalibrationEngine,
     IComplianceGateRepository,
     IConfidenceEngineAdapter,
+    IConsensusScorer,
+    IExplainabilityBridge,
+    IFeedbackAggregator,
     IFeedbackRepository,
     IHITLReviewRepository,
+    IPerformanceTracker,
+    IReviewQueueManager,
     IRoutingDecisionRepository,
 )
 from aumos_human_ai_collab.core.models import (
@@ -981,3 +989,956 @@ class FeedbackService:
             Calibration summary dict.
         """
         return await self._feedback.get_calibration_summary(tenant_id, task_type)
+
+
+# ---------------------------------------------------------------------------
+# New services wiring the 8 new domain adapters
+# ---------------------------------------------------------------------------
+
+
+class FeedbackAggregationService:
+    """Aggregate and analyse user feedback for model and feature quality.
+
+    Stores individual feedback records and produces trend reports, top-issue
+    summaries, and volume statistics. Publishes events on aggregation milestones.
+    """
+
+    def __init__(
+        self,
+        feedback_aggregator: IFeedbackAggregator,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            feedback_aggregator: Feedback storage and aggregation adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._aggregator = feedback_aggregator
+        self._publisher = event_publisher
+
+    async def submit_feedback(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        feature: str,
+        rating: int,
+        category: str,
+        text: str | None = None,
+        submitted_by: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        """Store feedback and emit a Kafka event.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            model_id: Model being rated.
+            feature: Feature being rated.
+            rating: Integer rating 1–5.
+            category: Feedback category.
+            text: Optional free-text comment.
+            submitted_by: Optional submitter UUID.
+
+        Returns:
+            Stored feedback record as a dict.
+
+        Raises:
+            ValueError: If rating or category is invalid.
+        """
+        record = await self._aggregator.store_feedback(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            feature=feature,
+            rating=rating,
+            category=category,
+            text=text,
+            submitted_by=submitted_by,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_FEEDBACK,
+            {
+                "event_type": "hac.feedback.submitted",
+                "tenant_id": str(tenant_id),
+                "model_id": model_id,
+                "feature": feature,
+                "rating": rating,
+                "category": category,
+            },
+        )
+
+        logger.info(
+            "User feedback submitted",
+            tenant_id=str(tenant_id),
+            model_id=model_id,
+            feature=feature,
+            rating=rating,
+        )
+
+        return record.to_dict() if hasattr(record, "to_dict") else record
+
+    async def get_model_trends(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        window_days: int = 30,
+    ) -> dict[str, Any]:
+        """Return aggregated feedback trends for a model.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            window_days: Lookback window in days.
+
+        Returns:
+            Aggregate trend dict.
+        """
+        return await self._aggregator.aggregate_by_model(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            window_days=window_days,
+        )
+
+    async def get_top_issues(
+        self,
+        tenant_id: uuid.UUID,
+        window_days: int = 7,
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return top user-reported issues.
+
+        Args:
+            tenant_id: Requesting tenant.
+            window_days: Lookback window in days.
+            top_n: Maximum issues to return.
+
+        Returns:
+            List of issue dicts sorted by severity.
+        """
+        return await self._aggregator.get_top_issues(
+            tenant_id=tenant_id,
+            window_days=window_days,
+            top_n=top_n,
+        )
+
+    async def export_feedback(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str | None = None,
+        feature: str | None = None,
+        category: str | None = None,
+        window_days: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Export raw feedback records for downstream analysis.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Optional model filter.
+            feature: Optional feature filter.
+            category: Optional category filter.
+            window_days: Optional lookback window.
+
+        Returns:
+            List of feedback record dicts.
+        """
+        return await self._aggregator.export_records(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            feature=feature,
+            category=category,
+            window_days=window_days,
+        )
+
+
+class AnnotationService:
+    """Manage crowdsourced annotation tasks and annotation collection.
+
+    Orchestrates task creation, annotator assignment, annotation storage,
+    progress monitoring, and export. Publishes events on task completion.
+    """
+
+    def __init__(
+        self,
+        annotation_engine: IAnnotationEngine,
+        consensus_scorer: IConsensusScorer,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            annotation_engine: Annotation task management adapter.
+            consensus_scorer: Inter-annotator agreement adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._engine = annotation_engine
+        self._consensus = consensus_scorer
+        self._publisher = event_publisher
+
+    async def create_annotation_task(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str,
+        name: str,
+        items: list[dict[str, Any]],
+        labels: list[str],
+        gold_items: list[dict[str, Any]] | None = None,
+        annotations_per_item: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create and publish an annotation task.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            task_type: Type of labeling task.
+            name: Human-readable name.
+            items: Items to annotate.
+            labels: Valid label strings.
+            gold_items: Optional gold standard items.
+            annotations_per_item: Override annotations-per-item default.
+            metadata: Additional configuration.
+
+        Returns:
+            Task summary dict.
+        """
+        task = await self._engine.create_task(
+            tenant_id=tenant_id,
+            task_type=task_type,
+            name=name,
+            items=items,
+            labels=labels,
+            gold_items=gold_items,
+            annotations_per_item=annotations_per_item,
+            metadata=metadata,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_HITL,
+            {
+                "event_type": "hac.annotation.task_created",
+                "tenant_id": str(tenant_id),
+                "task_id": task.get("task_id"),
+                "task_type": task_type,
+                "item_count": len(items),
+            },
+        )
+
+        logger.info(
+            "Annotation task created",
+            tenant_id=str(tenant_id),
+            task_type=task_type,
+            item_count=len(items),
+        )
+
+        return task
+
+    async def submit_annotation(
+        self,
+        task_id: uuid.UUID,
+        item_id: str,
+        annotator_id: uuid.UUID,
+        label: str,
+        confidence: float | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Store an annotation and return the result including gold-check outcome.
+
+        Args:
+            task_id: Task UUID.
+            item_id: Item being annotated.
+            annotator_id: Annotator UUID.
+            label: Chosen label.
+            confidence: Optional confidence.
+            notes: Optional notes.
+
+        Returns:
+            Annotation result dict with gold_check result if applicable.
+        """
+        return await self._engine.store_annotation(
+            task_id=task_id,
+            item_id=item_id,
+            annotator_id=annotator_id,
+            label=label,
+            confidence=confidence,
+            notes=notes,
+        )
+
+    async def get_consensus_report(
+        self,
+        task_id: uuid.UUID,
+        annotations: list[dict[str, str]],
+        labels: list[str],
+        annotator_ids: list[uuid.UUID],
+    ) -> dict[str, Any]:
+        """Generate a consensus agreement report for a task.
+
+        Args:
+            task_id: Task UUID (used as string label in report).
+            annotations: All task annotation dicts.
+            labels: All possible labels.
+            annotator_ids: All annotator UUIDs.
+
+        Returns:
+            Consensus report dict.
+        """
+        return self._consensus.generate_consensus_report(
+            task_id=str(task_id),
+            annotations=annotations,
+            labels=labels,
+            annotator_ids=annotator_ids,
+        )
+
+    async def export_task_annotations(
+        self,
+        task_id: uuid.UUID,
+        format: str = "jsonl",
+    ) -> str:
+        """Export annotations for a completed task.
+
+        Args:
+            task_id: Task UUID.
+            format: "jsonl" or "csv".
+
+        Returns:
+            Exported content string.
+        """
+        return await self._engine.export_annotations(
+            task_id=task_id,
+            format=format,
+            exclude_gold=True,
+        )
+
+
+class ActiveLearningService:
+    """Orchestrate active learning cycles for efficient labelling.
+
+    Manages unlabelled pools, selects samples to label using uncertainty
+    strategies, and tracks learning curve progress.
+    """
+
+    def __init__(
+        self,
+        active_learner: IActiveLearner,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            active_learner: Uncertainty sampling adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._learner = active_learner
+        self._publisher = event_publisher
+
+    async def add_unlabelled_pool(
+        self,
+        session_id: uuid.UUID,
+        samples: list[dict[str, Any]],
+    ) -> int:
+        """Add samples to the active learning pool.
+
+        Args:
+            session_id: Active learning session UUID.
+            samples: Unlabelled sample dicts.
+
+        Returns:
+            Total pool size after adding.
+        """
+        pool_size = self._learner.add_to_pool(session_id, samples)
+        logger.info(
+            "Samples added to active learning pool",
+            session_id=str(session_id),
+            added=len(samples),
+            pool_size=pool_size,
+        )
+        return pool_size
+
+    async def request_labels(
+        self,
+        session_id: uuid.UUID,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Select the most informative samples for labelling.
+
+        Args:
+            session_id: Active learning session UUID.
+            batch_size: Override default batch size.
+
+        Returns:
+            Selection result dict with selected_samples.
+        """
+        result = await self._learner.select_samples(
+            session_id=session_id,
+            batch_size=batch_size,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_HITL,
+            {
+                "event_type": "hac.active_learning.samples_selected",
+                "session_id": str(session_id),
+                "round_index": result.get("round_index"),
+                "selected_count": result.get("total_selected"),
+                "budget_remaining": result.get("budget_remaining"),
+            },
+        )
+
+        return result
+
+    async def record_round_outcome(
+        self,
+        session_id: uuid.UUID,
+        labels_used: int,
+        estimated_accuracy: float,
+    ) -> dict[str, Any]:
+        """Record the outcome of a labelling round.
+
+        Args:
+            session_id: Active learning session UUID.
+            labels_used: Number of labels used.
+            estimated_accuracy: Model accuracy after this round.
+
+        Returns:
+            LearningCurvePoint as a dict.
+        """
+        point = await self._learner.record_round_result(
+            session_id=session_id,
+            labels_used=labels_used,
+            estimated_accuracy=estimated_accuracy,
+        )
+        return point.to_dict() if hasattr(point, "to_dict") else point
+
+    def get_budget_status(self) -> dict[str, Any]:
+        """Return current label budget status.
+
+        Returns:
+            Budget status dict.
+        """
+        return self._learner.get_budget_status()
+
+
+class ExplainabilityService:
+    """Provide AI explanations to human reviewers.
+
+    Retrieves SHAP or LIME explanations from the aumos-explainability service,
+    formats them for human readability, and delivers the explanation package
+    for the reviewer interface.
+    """
+
+    def __init__(
+        self,
+        explainability_bridge: IExplainabilityBridge,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            explainability_bridge: Explanation retrieval adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._bridge = explainability_bridge
+        self._publisher = event_publisher
+
+    async def get_review_explanation(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        input_data: dict[str, Any],
+        prediction: dict[str, Any],
+        method: str = "shap",
+    ) -> dict[str, Any]:
+        """Get a formatted explanation package for a reviewer.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            input_data: Prediction input data.
+            prediction: Model output/prediction.
+            method: Explanation method — "shap" or "lime".
+
+        Returns:
+            Reviewer explanation package dict.
+        """
+        package = await self._bridge.get_explanation_for_review(
+            model_id=model_id,
+            input_data=input_data,
+            prediction=prediction,
+            tenant_id=tenant_id,
+            method=method,
+        )
+
+        logger.info(
+            "Explanation package delivered to reviewer",
+            tenant_id=str(tenant_id),
+            model_id=model_id,
+            method=method,
+            explanation_confidence=package.get("explanation_confidence"),
+        )
+
+        return package
+
+
+class ModelPerformanceService:
+    """Track and report on model performance over time.
+
+    Records metric snapshots, computes trends and velocity, performs A/B
+    comparisons of model versions, and generates comprehensive performance reports.
+    """
+
+    def __init__(
+        self,
+        performance_tracker: IPerformanceTracker,
+        event_publisher: EventPublisher,
+        alert_threshold_delta: float = -0.02,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            performance_tracker: Metric tracking adapter.
+            event_publisher: Kafka event publisher.
+            alert_threshold_delta: Minimum acceptable delta before raising a degradation alert.
+        """
+        self._tracker = performance_tracker
+        self._publisher = event_publisher
+        self._alert_threshold = alert_threshold_delta
+
+    async def record_metric(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        model_version: str,
+        metric_name: str,
+        metric_value: float,
+        segment: str | None = None,
+        data_type: str | None = None,
+        feedback_round_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a model metric snapshot and emit an event.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            model_id: Model identifier.
+            model_version: Model version string.
+            metric_name: Metric name.
+            metric_value: Measured value.
+            segment: Optional user segment.
+            data_type: Optional data type.
+            feedback_round_id: Optional feedback round identifier.
+
+        Returns:
+            Snapshot as dict.
+        """
+        snapshot = await self._tracker.record_metric(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            model_version=model_version,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            segment=segment,
+            data_type=data_type,
+            feedback_round_id=feedback_round_id,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_FEEDBACK,
+            {
+                "event_type": "hac.performance.metric_recorded",
+                "tenant_id": str(tenant_id),
+                "model_id": model_id,
+                "model_version": model_version,
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+            },
+        )
+
+        return snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
+
+    async def get_trend(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        metric_name: str = "accuracy",
+        window_days: int = 30,
+        segment: str | None = None,
+    ) -> dict[str, Any]:
+        """Return metric trend and raise a degradation alert if needed.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            metric_name: Metric to trend.
+            window_days: Lookback window.
+            segment: Optional segment filter.
+
+        Returns:
+            Trend dict.
+        """
+        trend = await self._tracker.get_accuracy_trend(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            metric_name=metric_name,
+            window_days=window_days,
+            segment=segment,
+        )
+
+        delta = trend.get("delta")
+        if delta is not None and delta < self._alert_threshold:
+            await self._publisher.publish(
+                Topics.HUMAN_AI_FEEDBACK,
+                {
+                    "event_type": "hac.performance.degradation_alert",
+                    "tenant_id": str(tenant_id),
+                    "model_id": model_id,
+                    "metric_name": metric_name,
+                    "delta": delta,
+                    "trend_direction": trend.get("trend_direction"),
+                },
+            )
+            logger.warning(
+                "Model performance degradation detected",
+                tenant_id=str(tenant_id),
+                model_id=model_id,
+                metric_name=metric_name,
+                delta=delta,
+            )
+
+        return trend
+
+    async def compare_ab(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        version_a: str,
+        version_b: str,
+        metric_name: str = "accuracy",
+        window_days: int = 14,
+    ) -> dict[str, Any]:
+        """Run an A/B performance comparison between two model versions.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            version_a: First version.
+            version_b: Second version.
+            metric_name: Metric to compare.
+            window_days: Lookback window.
+
+        Returns:
+            A/B comparison dict.
+        """
+        return await self._tracker.compare_versions(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            version_a=version_a,
+            version_b=version_b,
+            metric_name=metric_name,
+            window_days=window_days,
+        )
+
+    async def generate_report(
+        self,
+        tenant_id: uuid.UUID,
+        model_id: str,
+        window_days: int = 30,
+        include_versions: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Generate a comprehensive performance report.
+
+        Args:
+            tenant_id: Requesting tenant.
+            model_id: Model identifier.
+            window_days: Lookback window.
+            include_versions: Optional specific versions.
+
+        Returns:
+            Performance report dict.
+        """
+        return await self._tracker.generate_performance_report(
+            tenant_id=tenant_id,
+            model_id=model_id,
+            window_days=window_days,
+            include_versions=include_versions,
+        )
+
+
+class ConfidenceCalibrationService:
+    """Drive confidence score recalibration from feedback-derived ground truth.
+
+    Wraps the CalibrationEngine adapter with business logic: validates that
+    enough samples exist before calibrating, computes ECE improvement, and
+    emits recalibration events.
+    """
+
+    def __init__(
+        self,
+        calibration_engine: ICalibrationEngine,
+        feedback_repo: IFeedbackRepository,
+        event_publisher: EventPublisher,
+        min_samples_for_calibration: int = 20,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            calibration_engine: Calibration method adapter.
+            feedback_repo: FeedbackCorrection persistence.
+            event_publisher: Kafka event publisher.
+            min_samples_for_calibration: Minimum sample count before calibrating.
+        """
+        self._engine = calibration_engine
+        self._feedback = feedback_repo
+        self._publisher = event_publisher
+        self._min_samples = min_samples_for_calibration
+
+    async def run_calibration(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str,
+        confidences: list[float],
+        labels: list[int],
+        method: str = "temperature_scaling",
+    ) -> dict[str, Any]:
+        """Run confidence calibration and emit an event.
+
+        Args:
+            tenant_id: Requesting tenant.
+            task_type: Task type to calibrate.
+            confidences: Historical confidence scores.
+            labels: Ground-truth binary labels.
+            method: Calibration method to apply.
+
+        Returns:
+            CalibrationRecord as dict.
+
+        Raises:
+            ConflictError: If fewer samples than minimum threshold.
+        """
+        if len(confidences) < self._min_samples:
+            raise ConflictError(
+                message=(
+                    f"Insufficient samples for calibration. "
+                    f"Need {self._min_samples}, got {len(confidences)}."
+                ),
+                error_code=ErrorCode.INVALID_OPERATION,
+            )
+
+        record = await self._engine.recalibrate_from_feedback(
+            tenant_id=tenant_id,
+            task_type=task_type,
+            confidences=confidences,
+            labels=labels,
+            method=method,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_FEEDBACK,
+            {
+                "event_type": "hac.calibration.applied",
+                "tenant_id": str(tenant_id),
+                "task_type": task_type,
+                "method": method,
+                "ece_before": record.ece_before if hasattr(record, "ece_before") else None,
+                "ece_after": record.ece_after if hasattr(record, "ece_after") else None,
+                "sample_count": len(confidences),
+            },
+        )
+
+        logger.info(
+            "Confidence calibration completed",
+            tenant_id=str(tenant_id),
+            task_type=task_type,
+            method=method,
+            sample_count=len(confidences),
+        )
+
+        return record.to_dict() if hasattr(record, "to_dict") else record
+
+    def apply_to_confidence(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str,
+        raw_confidence: float,
+    ) -> float:
+        """Apply current calibration parameters to a raw confidence score.
+
+        Returns raw_confidence unchanged if no calibration exists for the task type.
+
+        Args:
+            tenant_id: Requesting tenant.
+            task_type: Task type.
+            raw_confidence: Raw model confidence.
+
+        Returns:
+            Calibrated confidence score.
+        """
+        params = self._engine.get_calibration_history(
+            tenant_id=tenant_id,
+            task_type=task_type,
+            limit=1,
+        )
+        if not params:
+            return raw_confidence
+
+        latest_params = params[0].get("params", {})
+        return self._engine.apply_calibration(raw_confidence, latest_params)
+
+    def get_calibration_history(
+        self,
+        tenant_id: uuid.UUID,
+        task_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return calibration history for a tenant.
+
+        Args:
+            tenant_id: Requesting tenant.
+            task_type: Optional task type filter.
+            limit: Maximum records to return.
+
+        Returns:
+            List of CalibrationRecord dicts.
+        """
+        return self._engine.get_calibration_history(
+            tenant_id=tenant_id,
+            task_type=task_type,
+            limit=limit,
+        )
+
+
+class ReviewQueueService:
+    """Manage the HITL review priority queue.
+
+    Handles enqueuing newly routed reviews, assigning them to reviewers,
+    completing them, monitoring depth, and handling timeouts with reassignment.
+    """
+
+    def __init__(
+        self,
+        queue_manager: IReviewQueueManager,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            queue_manager: Priority queue adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._queue = queue_manager
+        self._publisher = event_publisher
+
+    async def enqueue_review(
+        self,
+        tenant_id: uuid.UUID,
+        review_id: uuid.UUID,
+        task_type: str,
+        confidence: float,
+        urgency: int = 2,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Enqueue a new HITL review and publish an event.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            review_id: HITLReview UUID.
+            task_type: Task category.
+            confidence: Model confidence score.
+            urgency: Review urgency 1–4.
+            metadata: Optional review context.
+
+        Returns:
+            QueueItem as dict.
+        """
+        item = await self._queue.enqueue(
+            tenant_id=tenant_id,
+            review_id=review_id,
+            task_type=task_type,
+            confidence=confidence,
+            urgency=urgency,
+            metadata=metadata,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_HITL,
+            {
+                "event_type": "hac.queue.review_enqueued",
+                "tenant_id": str(tenant_id),
+                "review_id": str(review_id),
+                "task_type": task_type,
+                "urgency": urgency,
+                "priority_score": item.priority_score if hasattr(item, "priority_score") else None,
+            },
+        )
+
+        return item.to_dict() if hasattr(item, "to_dict") else item
+
+    async def claim_next_review(
+        self,
+        tenant_id: uuid.UUID,
+        reviewer_id: uuid.UUID,
+    ) -> dict[str, Any] | None:
+        """Assign the next highest-priority review to a reviewer.
+
+        Args:
+            tenant_id: Requesting tenant.
+            reviewer_id: Reviewer UUID.
+
+        Returns:
+            Assigned QueueItem as dict, or None if queue is empty.
+        """
+        item = await self._queue.assign_to_reviewer(
+            tenant_id=tenant_id,
+            reviewer_id=reviewer_id,
+        )
+        if item is None:
+            return None
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_HITL,
+            {
+                "event_type": "hac.queue.review_assigned",
+                "tenant_id": str(tenant_id),
+                "reviewer_id": str(reviewer_id),
+                "review_id": str(item.review_id) if hasattr(item, "review_id") else None,
+                "wait_seconds": item.wait_seconds if hasattr(item, "wait_seconds") else None,
+            },
+        )
+
+        return item.to_dict() if hasattr(item, "to_dict") else item
+
+    async def complete_review(
+        self,
+        tenant_id: uuid.UUID,
+        item_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Mark a queue item as completed.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            item_id: Queue item UUID.
+
+        Returns:
+            Completed QueueItem as dict.
+        """
+        item = await self._queue.mark_completed(
+            tenant_id=tenant_id,
+            item_id=item_id,
+        )
+
+        await self._publisher.publish(
+            Topics.HUMAN_AI_HITL,
+            {
+                "event_type": "hac.queue.review_completed",
+                "tenant_id": str(tenant_id),
+                "item_id": str(item_id),
+            },
+        )
+
+        return item.to_dict() if hasattr(item, "to_dict") else item
+
+    async def get_analytics(self, tenant_id: uuid.UUID) -> dict[str, Any]:
+        """Return queue analytics for a tenant.
+
+        Args:
+            tenant_id: Requesting tenant.
+
+        Returns:
+            Queue analytics dict.
+        """
+        return await self._queue.get_queue_analytics(tenant_id)
