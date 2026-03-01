@@ -113,4 +113,52 @@ class Settings(AumOSSettings):
         description="Maximum retry attempts for HTTP calls to upstream services",
     )
 
+    # ---------------------------------------------------------------------------
+    # GAP-256: Reviewer UI
+    # ---------------------------------------------------------------------------
+    ui_enabled: bool = Field(
+        default=True,
+        description="Enable the Jinja2 server-rendered reviewer interface at /ui/*",
+    )
+    ui_session_ttl_hours: int = Field(
+        default=8,
+        description="Reviewer interface session TTL in hours",
+    )
+
+    # ---------------------------------------------------------------------------
+    # GAP-257: LLM Evaluation
+    # ---------------------------------------------------------------------------
+    llm_evaluation_enabled: bool = Field(
+        default=True,
+        description="Enable LLM-as-judge evaluation for AI output quality scoring",
+    )
+    llm_evaluation_pass_threshold: float = Field(
+        default=0.70,
+        description="Composite score below which output is flagged for priority review",
+    )
+    evaluator_model_id: str = Field(
+        default="claude-sonnet-4-6",
+        description="Model ID of the judge LLM for evaluation",
+    )
+    llm_serving_url: str = Field(
+        default="http://localhost:8007",
+        description="Base URL for aumos-llm-serving (evaluator model inference)",
+    )
+
+    # ---------------------------------------------------------------------------
+    # GAP-259: Label Studio Integration
+    # ---------------------------------------------------------------------------
+    label_studio_enabled: bool = Field(
+        default=False,
+        description="Enable Label Studio integration adapter",
+    )
+    label_studio_base_url: str = Field(
+        default="http://localhost:8080",
+        description="Base URL for the Label Studio instance",
+    )
+    label_studio_api_key: str = Field(
+        default="",
+        description="Label Studio API key for project and task management",
+    )
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_HUMAN_AI_")

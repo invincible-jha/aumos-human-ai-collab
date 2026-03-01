@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from aumos_common.app import create_app
 from aumos_common.database import init_database
@@ -19,7 +20,17 @@ from aumos_human_ai_collab.adapters.repositories import (
     HITLReviewRepository,
     RoutingDecisionRepository,
 )
+from aumos_human_ai_collab.api.gap_router import gap_router
 from aumos_human_ai_collab.api.router import router
+from aumos_human_ai_collab.api.ui_router import ui_router
+from aumos_human_ai_collab.core.gap_services import (
+    AnnotationSchemaService,
+    LabelStudioService,
+    LLMEvaluationService,
+    PromptManagementService,
+    ReviewerUIService,
+    WorkforceService,
+)
 from aumos_human_ai_collab.core.services import (
     AttributionService,
     ComplianceGateService,
@@ -29,10 +40,14 @@ from aumos_human_ai_collab.core.services import (
 )
 from aumos_human_ai_collab.settings import Settings
 
+import pathlib
+
 logger = get_logger(__name__)
 settings = Settings()
 
 _kafka_publisher: HumanAIEventPublisher | None = None
+
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
 
 
 @asynccontextmanager
@@ -75,7 +90,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         http_timeout=settings.http_timeout,
     )
 
-    # Service instances with dependency injection
+    # Core service instances with dependency injection
     app.state.routing_service = RoutingService(
         routing_repo=routing_repo,
         compliance_repo=compliance_repo,
@@ -111,6 +126,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         feedback_decay_factor=settings.feedback_decay_factor,
     )
 
+    # GAP-256: Reviewer UI session service
+    app.state.reviewer_ui_service = ReviewerUIService(
+        event_publisher=_kafka_publisher,
+        session_ttl_hours=settings.ui_session_ttl_hours,
+    )
+
+    # GAP-257: LLM evaluation service
+    app.state.llm_evaluation_service = LLMEvaluationService(
+        event_publisher=_kafka_publisher,
+        pass_threshold=settings.llm_evaluation_pass_threshold,
+    )
+
+    # GAP-258: Annotation schema service
+    app.state.annotation_schema_service = AnnotationSchemaService(
+        event_publisher=_kafka_publisher,
+    )
+
+    # GAP-259: Label Studio integration service
+    app.state.label_studio_service = LabelStudioService(
+        event_publisher=_kafka_publisher,
+    )
+
+    # GAP-260: Workforce management service
+    app.state.workforce_service = WorkforceService(
+        event_publisher=_kafka_publisher,
+    )
+
+    # GAP-261: Prompt management service
+    app.state.prompt_management_service = PromptManagementService(
+        event_publisher=_kafka_publisher,
+    )
+
     # Expose settings on app state for dependency injection
     app.state.settings = settings
 
@@ -136,4 +183,12 @@ app: FastAPI = create_app(
     ],
 )
 
+# API routes
 app.include_router(router, prefix="/api/v1")
+app.include_router(gap_router, prefix="/api/v1")
+
+# Reviewer UI (GAP-256) — server-rendered HTML, optional
+if settings.ui_enabled:
+    app.include_router(ui_router)
+    if _STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
