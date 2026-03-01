@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block title %}Review {{ review.id }} &mdash; AumOS HITL{% endblock %}
+
+{% block content %}
+<div class="review-detail-layout">
+    <div class="review-context-panel">
+        <h2 class="panel-title">Task Context</h2>
+        <dl class="context-list">
+            <dt>Task Type</dt><dd>{{ review.task_type }}</dd>
+            <dt>Routing</dt><dd>{{ review.routing_outcome | default("N/A") }}</dd>
+            <dt>Priority</dt><dd>{{ review.priority }}</dd>
+            {% if review.due_at %}
+            <dt>Due</dt><dd>{{ review.due_at.strftime('%Y-%m-%d %H:%M UTC') }}</dd>
+            {% endif %}
+            {% if compliance_gate %}
+            <dt>Compliance Gate</dt>
+            <dd class="compliance-warning">{{ compliance_gate.gate_name }} ({{ compliance_gate.regulation }})</dd>
+            {% endif %}
+        </dl>
+    </div>
+
+    <div class="review-output-panel">
+        <h2 class="panel-title">AI Output</h2>
+        <div class="ai-output-box">
+            <pre class="ai-output-content">{{ ai_output | tojson(indent=2) }}</pre>
+        </div>
+    </div>
+
+    <div class="review-decision-panel">
+        <h2 class="panel-title">Your Decision</h2>
+        <form method="POST" action="/ui/review/{{ review.id }}/decide" id="decision-form">
+            <div class="form-group">
+                <label for="decision" class="form-label">Decision</label>
+                <select name="decision" id="decision" class="form-select" required>
+                    <option value="">-- Select decision --</option>
+                    <option value="approved">Approve</option>
+                    <option value="rejected">Reject</option>
+                    <option value="modified">Modify</option>
+                </select>
+            </div>
+
+            <div class="form-group" id="modifications-group" style="display:none;">
+                <label for="modifications" class="form-label">Modified Output (JSON)</label>
+                <textarea name="modifications" id="modifications" class="form-textarea" rows="6"
+                    placeholder='{"modified_field": "modified value"}'></textarea>
+            </div>
+
+            <div class="form-group">
+                <label for="justification" class="form-label">Justification</label>
+                <textarea name="justification" id="justification" class="form-textarea" rows="4"
+                    placeholder="Explain your decision..." required></textarea>
+            </div>
+
+            <div class="form-actions">
+                <a href="/ui/review-queue" class="btn btn-secondary">Cancel</a>
+                <button type="submit" class="btn btn-primary" id="submit-btn">Submit Decision</button>
+            </div>
+        </form>
+        <p class="keyboard-hint">Shortcuts: <kbd>Ctrl+A</kbd> Approve &mdash; <kbd>Ctrl+R</kbd> Reject</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('decision').addEventListener('change', function() {
+    var modGroup = document.getElementById('modifications-group');
+    modGroup.style.display = (this.value === 'modified') ? 'block' : 'none';
+});
+</script>
+{% endblock %}

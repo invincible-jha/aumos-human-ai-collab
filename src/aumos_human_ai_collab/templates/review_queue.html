@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Review Queue &mdash; AumOS HITL{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Review Queue</h1>
+    <span class="badge badge-count">{{ reviews | length }} pending</span>
+</div>
+
+{% if reviews %}
+<div class="review-list">
+    {% for review in reviews %}
+    <div class="review-card review-priority-{{ review.priority }}">
+        <div class="review-card-header">
+            <span class="review-id">{{ review.id }}</span>
+            <span class="review-type badge">{{ review.task_type }}</span>
+            <span class="review-annotation-type badge badge-secondary">{{ review.annotation_type | default("text") }}</span>
+            {% if review.compliance_gate_triggered %}
+            <span class="badge badge-compliance">Compliance Gate</span>
+            {% endif %}
+        </div>
+        <div class="review-card-body">
+            <div class="review-meta">
+                <span class="meta-label">Due:</span>
+                <span class="meta-value {% if review.due_at %}due-date{% endif %}">
+                    {{ review.due_at.strftime('%Y-%m-%d %H:%M UTC') if review.due_at else 'No deadline' }}
+                </span>
+            </div>
+        </div>
+        <div class="review-card-actions">
+            <a href="/ui/review/{{ review.id }}" class="btn btn-primary">Start Review</a>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <p class="empty-state-message">No pending reviews. Check back later.</p>
+</div>
+{% endif %}
+{% endblock %}

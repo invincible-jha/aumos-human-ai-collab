@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Reviewer Dashboard &mdash; AumOS HITL{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Reviewer Dashboard</h1>
+</div>
+
+{% if profile %}
+<div class="dashboard-grid">
+    <div class="stat-card">
+        <div class="stat-value">{{ profile.total_reviews_completed }}</div>
+        <div class="stat-label">Total Completed</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ profile.current_review_count }}</div>
+        <div class="stat-label">Active Reviews</div>
+    </div>
+    <div class="stat-card">
+        {% if profile.avg_review_time_seconds %}
+        <div class="stat-value">{{ (profile.avg_review_time_seconds / 60) | round(1) }}m</div>
+        {% else %}
+        <div class="stat-value">—</div>
+        {% endif %}
+        <div class="stat-label">Avg Review Time</div>
+    </div>
+    <div class="stat-card">
+        {% if profile.accuracy_score %}
+        <div class="stat-value">{{ (profile.accuracy_score * 100) | round(1) }}%</div>
+        {% else %}
+        <div class="stat-value">—</div>
+        {% endif %}
+        <div class="stat-label">Accuracy Score</div>
+    </div>
+</div>
+
+<div class="profile-section">
+    <h2>Skill Tags</h2>
+    <div class="tag-list">
+        {% for tag in profile.skill_tags %}
+        <span class="tag">{{ tag }}</span>
+        {% else %}
+        <span class="empty-text">No skill tags configured</span>
+        {% endfor %}
+    </div>
+</div>
+{% else %}
+<div class="empty-state">
+    <p>No reviewer profile found. Contact your administrator.</p>
+</div>
+{% endif %}
+{% endblock %}

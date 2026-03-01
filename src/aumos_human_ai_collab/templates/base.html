@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}AumOS HITL Review{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/review.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-brand">
+            <span class="brand-name">AumOS</span>
+            <span class="brand-subtitle">HITL Review Interface</span>
+        </div>
+        <nav class="header-nav">
+            <a href="/ui/review-queue" class="nav-link">Review Queue</a>
+            <a href="/ui/dashboard" class="nav-link">Dashboard</a>
+        </nav>
+    </header>
+
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <span>AumOS Human-AI Collaboration Platform &mdash; HITL Reviewer Interface</span>
+    </footer>
+
+    <script src="/static/js/review.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
